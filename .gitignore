@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+previews*/
+*.csv
+*_filled.json
+plan*.json
+*_donors.txt
