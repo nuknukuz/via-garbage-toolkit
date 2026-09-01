@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-via_propagate.py v4.2.1 — полуавтоматическая разметка паков кадров VIA 2.x.
+via_propagate.py v4.2.2 — полуавтоматическая разметка паков кадров VIA 2.x.
 
 РАБОЧИЙ ЦИКЛ (два запуска):
 
@@ -31,7 +31,9 @@ via_propagate.py v4.2.1 — полуавтоматическая разметк�
        внутри одного донора не трогаем (там соседние объекты — норма);
      - доноры (из плана или --donors) могут лежать ВНЕ интервалов кластеров —
        тогда они используются как источники для всех целей (в одиночном режиме
-       дополнительно режутся --max-dist).
+       дополнительно режутся --max-dist);
+     - доноры, не прошедшие матчинг с целью, видны в отчёте: строка цели
+       заканчивается на "(не сошлись: файл:статус)" + колонка failed_donors.
 
   Резерв (если план потерян/терминал слетел):
        python via_propagate.py marked.json --clusters "2685-2730,2731-2912" --donors "garbage.0002690.jpg,garbage.0002738.jpg" --root . --out filled.json [--merge-donors]
@@ -453,7 +455,8 @@ def _merge_donors_row(via, items, ti, lo, hi, allowed, min_source_regions,
     Доноры сортируются по числу совпадений дескрипторов с целью (убывание) —
     в этом порядке боксы идут в dedup_boxes, поэтому при дубликате выживает
     бокс с более надёжно сматчившегося донора. max_dist намеренно не режется:
-    доноры заданы явно, качество каждой пары гейтится inliers-порогами."""
+    доноры заданы явно, качество каждой пары гейтится inliers-порогами.
+    Несошедшиеся доноры попадают в поле отчёта failed_donors (файл:статус)."""
     t = items[ti]
     cands = []
     for si in donor_pool(lo, hi, donor_idx):
@@ -492,6 +495,8 @@ def _merge_donors_row(via, items, ti, lo, hi, allowed, min_source_regions,
                               'donor': si, 'region': nr})
 
     n_ok = sum(1 for d in donor_stats if d['status'] == 'ok')
+    failed = ';'.join(f"{d['donor']}:{d['status']}"
+                      for d in donor_stats if d['status'] != 'ok')
     used = []
     for b in collected:
         fn = items[b['donor']]['fn']
@@ -502,7 +507,8 @@ def _merge_donors_row(via, items, ti, lo, hi, allowed, min_source_regions,
         st = donor_stats[0]['status'] if donor_stats else 'no_source_in_cluster'
         return {'target': t['fn'], 'status': st, 'dist': '',
                 'source': ';'.join(d['donor'] for d in donor_stats),
-                'boxes_in': 0, 'boxes_kept': 0, 'dedup_dropped': 0}
+                'boxes_in': 0, 'boxes_kept': 0, 'dedup_dropped': 0,
+                'failed_donors': failed}
 
     kept_boxes, dropped_boxes = dedup_boxes(collected, dup_overlap)
     tgt_meta = via['_via_img_metadata'][t['key']]
@@ -515,7 +521,8 @@ def _merge_donors_row(via, items, ti, lo, hi, allowed, min_source_regions,
            'method': f'multi({n_ok}/{len(cands)})',
            'donor_matches': cands[0][0],
            'boxes_in': len(collected), 'boxes_kept': len(kept_boxes),
-           'dedup_dropped': len(dropped_boxes)}
+           'dedup_dropped': len(dropped_boxes),
+           'failed_donors': failed}
     if ok_stats:
         row['inliers'] = min(d.get('inliers', 0) for d in ok_stats)
         row['inlier_ratio'] = min(d.get('inlier_ratio', 0) for d in ok_stats)
@@ -715,11 +722,14 @@ def cmd_apply(args, via, items, root, clusters, donor_fns=None):
 
 def report(args, via, root, targets, rows):
     cols = ['target', 'source', 'dist', 'status', 'method', 'donor_matches',
-            'matches', 'inliers', 'inlier_ratio', 'boxes_in', 'boxes_kept', 'dedup_dropped']
+            'matches', 'inliers', 'inlier_ratio', 'boxes_in', 'boxes_kept',
+            'dedup_dropped', 'failed_donors']
     n_ok = 0
     for r in rows:
         n_ok += str(r.get('status', '')).startswith('ok')
         suffix = f" (−{r['dedup_dropped']} дублей)" if r.get('dedup_dropped') else ''
+        if r.get('failed_donors'):
+            suffix += f" (не сошлись: {r['failed_donors']})"
         print('  {target} <- {source} [{status}] {method} dm={donor_matches} '
               'boxes={boxes_kept}/{boxes_in}'.format(**{k: r.get(k, '') for k in cols}) + suffix)
     print(f'Итого: ok {n_ok}/{len(rows)}')
