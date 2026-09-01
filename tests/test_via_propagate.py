@@ -140,9 +140,16 @@ def t_dedup_boxes():
     ok(len(kept) == 2, 'dedup: большой кандидат поверх маленького остаётся (правило асимметрично)')
 
 
+def t_donor_pool():
+    ok(vp.donor_pool(2, 5) == [2, 3, 4, 5], 'donor_pool: без явных доноров — только кластер')
+    ok(vp.donor_pool(2, 5, {0, 9}) == [0, 2, 3, 4, 5, 9],
+       'donor_pool: явные доноры вне кластера добавляются')
+
+
 if __name__ == '__main__':
     for f in [t_frame_number, t_build_items, t_parse_ranges, t_warp_rect, t_unscale_H,
-              t_sig_distance, t_suggest_donors, t_plan_roundtrip, t_rect_regions, t_dedup_boxes]:
+              t_sig_distance, t_suggest_donors, t_plan_roundtrip, t_rect_regions,
+              t_dedup_boxes, t_donor_pool]:
         f()
     print()
     if FAILS:

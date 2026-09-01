@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-via_propagate.py v4.2 — полуавтоматическая разметка паков кадров VIA 2.x.
+via_propagate.py v4.2.1 — полуавтоматическая разметка паков кадров VIA 2.x.
 
 РАБОЧИЙ ЦИКЛ (два запуска):
 
@@ -28,7 +28,10 @@ via_propagate.py v4.2 — полуавтоматическая разметка 
        затем дубликаты схлопываются: если >= --dup-overlap (0.65) площади бокса
        перекрыто уже оставленным боксом ДРУГОГО донора — бокс выбрасывается.
        Приоритет у донора с большим числом совпадений с целью. Перекрытия
-       внутри одного донора не трогаем (там соседние объекты — норма).
+       внутри одного донора не трогаем (там соседние объекты — норма);
+     - доноры (из плана или --donors) могут лежать ВНЕ интервалов кластеров —
+       тогда они используются как источники для всех целей (в одиночном режиме
+       дополнительно режутся --max-dist).
 
   Резерв (если план потерян/терминал слетел):
        python via_propagate.py marked.json --clusters "2685-2730,2731-2912" --donors "garbage.0002690.jpg,garbage.0002738.jpg" --root . --out filled.json [--merge-donors]
@@ -325,10 +328,20 @@ def coverage_check(items, lo, hi, donors, min_matches):
     return poor
 
 
-def pick_donor(items, ti, lo, hi, min_regions, max_dist, ratio=0.78, allowed=None):
+def donor_pool(lo, hi, donor_idx=None):
+    """Пул кандидатов в доноры: кадры кластера ∪ явно заданные доноры
+    (те могут лежать вне интервалов кластеров — удобно для ручного режима)."""
+    pool = set(range(lo, hi + 1))
+    if donor_idx:
+        pool |= set(donor_idx)
+    return sorted(pool)
+
+
+def pick_donor(items, ti, lo, hi, min_regions, max_dist, ratio=0.78, allowed=None,
+               donor_idx=None):
     """Донор для цели: максимум совпадений дескрипторов, при равенстве — ближайший."""
     best = None
-    for si in range(lo, hi + 1):
+    for si in donor_pool(lo, hi, donor_idx):
         if si == ti or abs(si - ti) > max_dist:
             continue
         if allowed is not None and si not in allowed:
@@ -347,7 +360,7 @@ def pick_donor(items, ti, lo, hi, min_regions, max_dist, ratio=0.78, allowed=Non
 def propagate(via, root, targets, max_dist=8, min_source_regions=3,
               min_inliers=12, min_inlier_ratio=0.25, allow_affine=True,
               chain=False, clusters=None, items=None,
-              merge_donors=False, dup_overlap=0.65):
+              merge_donors=False, dup_overlap=0.65, donor_idx=None):
     try:
         import cv2  # noqa: F401
     except ImportError:
@@ -368,13 +381,14 @@ def propagate(via, root, targets, max_dist=8, min_source_regions=3,
             if merge_donors:
                 rows.append(_merge_donors_row(
                     via, items, ti, lo, hi, allowed, min_source_regions,
-                    min_inliers, min_inlier_ratio, allow_affine, dup_overlap))
+                    min_inliers, min_inlier_ratio, allow_affine, dup_overlap,
+                    donor_idx=donor_idx))
                 if chain:
                     manual.add(ti)
                 continue
 
             si, donor_score = pick_donor(items, ti, lo, hi, min_source_regions, max_dist,
-                                         allowed=allowed)
+                                         allowed=allowed, donor_idx=donor_idx)
             if si is None:
                 rows.append({'target': t['fn'], 'status': 'no_source_in_cluster',
                              'dist': '', 'source': '', 'boxes_in': 0, 'boxes_kept': 0})
@@ -432,7 +446,8 @@ def propagate(via, root, targets, max_dist=8, min_source_regions=3,
 
 
 def _merge_donors_row(via, items, ti, lo, hi, allowed, min_source_regions,
-                      min_inliers, min_inlier_ratio, allow_affine, dup_overlap):
+                      min_inliers, min_inlier_ratio, allow_affine, dup_overlap,
+                      donor_idx=None):
     """Сумма боксов со ВСЕХ размеченных доноров кластера + дедупликация.
 
     Доноры сортируются по числу совпадений дескрипторов с целью (убывание) —
@@ -441,7 +456,7 @@ def _merge_donors_row(via, items, ti, lo, hi, allowed, min_source_regions,
     доноры заданы явно, качество каждой пары гейтится inliers-порогами."""
     t = items[ti]
     cands = []
-    for si in range(lo, hi + 1):
+    for si in donor_pool(lo, hi, donor_idx):
         if si == ti:
             continue
         if allowed is not None and si not in allowed:
@@ -664,11 +679,19 @@ def cmd_plan(args, via, items, root):
 def cmd_apply(args, via, items, root, clusters, donor_fns=None):
     if donor_fns is None and args.donors:
         donor_fns = set(x.strip() for x in args.donors.split(','))
+    donor_idx = None
     if donor_fns:
         known = {d['fn'] for d in items}
         unknown = donor_fns - known
         if unknown:
             print(f'ВНИМАНИЕ: доноры не найдены в проекте: {sorted(unknown)}')
+        fn2idx = {d['fn']: i for i, d in enumerate(items)}
+        donor_idx = {fn2idx[fn] for fn in donor_fns if fn in fn2idx}
+        out_cl = sorted(fn for fn in donor_fns
+                        if fn in fn2idx and cluster_of(clusters, fn2idx[fn]) is None)
+        if out_cl:
+            print('Доноры вне интервалов кластеров: ' + ', '.join(out_cl) +
+                  ' — используются как источники для всех целей')
     print(f'Словарь признаков для {len(items)} кадров...')
     build_dictionary(items, root, max_dim=args.max_dim, nfeatures=args.sig_feats)
     targets, how = choose_targets(args, items, clusters, donor_fns)
@@ -686,7 +709,7 @@ def cmd_apply(args, via, items, root, clusters, donor_fns=None):
                           allow_affine=not args.no_affine, chain=args.chain,
                           clusters=clusters, items=items,
                           merge_donors=args.merge_donors,
-                          dup_overlap=args.dup_overlap)
+                          dup_overlap=args.dup_overlap, donor_idx=donor_idx)
     report(args, via, root, targets, rows)
 
 
