@@ -119,9 +119,30 @@ def t_rect_regions():
     ok(len(vp.rect_regions(meta)) == 1, 'rect_regions отсекает не-rect')
 
 
+def t_dedup_boxes():
+    def A(donor, **kw):
+        return dict({'x': 0, 'y': 0, 'w': 100, 'h': 100, 'donor': donor}, **kw)
+    kept, dropped = vp.dedup_boxes([A(0), A(1)], 0.65)
+    ok(len(kept) == 1 and kept[0]['donor'] == 0 and len(dropped) == 1,
+       'dedup: идентичные боксы с разных доноров -> один (приоритет первого)')
+    kept, _ = vp.dedup_boxes([A(0), A(1, x=40)], 0.65)
+    ok(len(kept) == 2, 'dedup: перекрытие 60% < порога 0.65 -> оба остаются')
+    kept, dropped = vp.dedup_boxes([A(0), A(1, x=20)], 0.65)
+    ok(len(kept) == 1 and len(dropped) == 1, 'dedup: перекрытие 80% > порога -> дубликат выброшен')
+    kept, _ = vp.dedup_boxes([A(0), A(0, x=10)], 0.65)
+    ok(len(kept) == 2, 'dedup: перекрытие внутри одного донора сохраняется')
+    big = A(0, w=200, h=200)
+    small = A(1, x=50, y=50, w=20, h=20)
+    kept, dropped = vp.dedup_boxes([big, small], 0.65)
+    ok(len(kept) == 1 and kept[0]['w'] == 200,
+       'dedup: кандидат, на 100% накрытый чужим боксом, выбрасывается')
+    kept, _ = vp.dedup_boxes([small, big], 0.65)
+    ok(len(kept) == 2, 'dedup: большой кандидат поверх маленького остаётся (правило асимметрично)')
+
+
 if __name__ == '__main__':
     for f in [t_frame_number, t_build_items, t_parse_ranges, t_warp_rect, t_unscale_H,
-              t_sig_distance, t_suggest_donors, t_plan_roundtrip, t_rect_regions]:
+              t_sig_distance, t_suggest_donors, t_plan_roundtrip, t_rect_regions, t_dedup_boxes]:
         f()
     print()
     if FAILS:

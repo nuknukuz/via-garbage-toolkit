@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-via_propagate.py v4.1 — полуавтоматическая разметка паков кадров VIA 2.x.
+via_propagate.py v4.2 — полуавтоматическая разметка паков кадров VIA 2.x.
 
 РАБОЧИЙ ЦИКЛ (два запуска):
 
@@ -22,11 +22,16 @@ via_propagate.py v4.1 — полуавтоматическая разметка 
        python via_propagate.py pack_014_saved.json --use-plan plan14.json --root . --out filled.json --draw previews14
      - ЦЕЛИ = ВСЕ кадры кластеров, КРОМЕ доноров из плана (старая разметка
        на целях заменяется перенесённой; входной json не меняется);
-     - доноры внутри кластера выбираются по максимуму совпадений дескрипторов;
-     - гомография — по кэшу словаря, без повторного чтения файлов.
+     - по умолчанию донор для цели один — по максимуму совпадений дескрипторов;
+     - с --merge-donors на цель переносится СУММА боксов со всех размеченных
+       доноров кластера: каждый донор матчится отдельно (гомография по кэшу),
+       затем дубликаты схлопываются: если >= --dup-overlap (0.65) площади бокса
+       перекрыто уже оставленным боксом ДРУГОГО донора — бокс выбрасывается.
+       Приоритет у донора с большим числом совпадений с целью. Перекрытия
+       внутри одного донора не трогаем (там соседние объекты — норма).
 
   Резерв (если план потерян/терминал слетел):
-       python via_propagate.py marked.json --clusters "2685-2730,2731-2912" --donors "garbage.0002690.jpg,garbage.0002738.jpg" --root . --out filled.json
+       python via_propagate.py marked.json --clusters "2685-2730,2731-2912" --donors "garbage.0002690.jpg,garbage.0002738.jpg" --root . --out filled.json [--merge-donors]
 
   Режимы целей (--targets-mode):
      auto      — nondonors, если задан план/--donors, иначе empty (по умолчанию)
@@ -105,6 +110,31 @@ def warp_rect(sa, H, img_w, img_h, min_keep_frac=0.25, min_side=3):
     if area_warped > 0 and (nw * nh) / area_warped < min_keep_frac:
         return None
     return x0, y0, nw, nh
+
+
+def overlap_frac(a, b):
+    """Доля площади бокса a, перекрытая боксом b. Боксы: {'x','y','w','h'}."""
+    x0 = max(a['x'], b['x']); y0 = max(a['y'], b['y'])
+    x1 = min(a['x'] + a['w'], b['x'] + b['w'])
+    y1 = min(a['y'] + a['h'], b['y'] + b['h'])
+    inter = max(0, x1 - x0) * max(0, y1 - y0)
+    return inter / max(1, a['w'] * a['h'])
+
+
+def dedup_boxes(boxes, thr=0.65):
+    """Дедупликация суммы боксов, перенесённых с РАЗНЫХ доноров.
+
+    boxes — в порядке приоритета (раньше = надёжнее). Бокс выбрасывается,
+    если >= thr его площади перекрыто уже оставленным боксом другого донора.
+    Перекрытия внутри одного донора сохраняются (соседние объекты — норма).
+    Возвращает (kept, dropped)."""
+    kept, dropped = [], []
+    for b in boxes:
+        if any(k['donor'] != b['donor'] and overlap_frac(b, k) >= thr for k in kept):
+            dropped.append(b)
+        else:
+            kept.append(b)
+    return kept, dropped
 
 
 # ----------------------------- словарь признаков -----------------------------
@@ -316,7 +346,8 @@ def pick_donor(items, ti, lo, hi, min_regions, max_dist, ratio=0.78, allowed=Non
 
 def propagate(via, root, targets, max_dist=8, min_source_regions=3,
               min_inliers=12, min_inlier_ratio=0.25, allow_affine=True,
-              chain=False, clusters=None, items=None):
+              chain=False, clusters=None, items=None,
+              merge_donors=False, dup_overlap=0.65):
     try:
         import cv2  # noqa: F401
     except ImportError:
@@ -333,6 +364,15 @@ def propagate(via, root, targets, max_dist=8, min_source_regions=3,
             cl = cluster_of(clusters, ti)
             lo, hi = cl if cl else (ti, ti)
             allowed = None if chain else manual
+
+            if merge_donors:
+                rows.append(_merge_donors_row(
+                    via, items, ti, lo, hi, allowed, min_source_regions,
+                    min_inliers, min_inlier_ratio, allow_affine, dup_overlap))
+                if chain:
+                    manual.add(ti)
+                continue
+
             si, donor_score = pick_donor(items, ti, lo, hi, min_source_regions, max_dist,
                                          allowed=allowed)
             if si is None:
@@ -389,6 +429,82 @@ def propagate(via, root, targets, max_dist=8, min_source_regions=3,
         if chain:
             manual.add(ti)
     return via, rows
+
+
+def _merge_donors_row(via, items, ti, lo, hi, allowed, min_source_regions,
+                      min_inliers, min_inlier_ratio, allow_affine, dup_overlap):
+    """Сумма боксов со ВСЕХ размеченных доноров кластера + дедупликация.
+
+    Доноры сортируются по числу совпадений дескрипторов с целью (убывание) —
+    в этом порядке боксы идут в dedup_boxes, поэтому при дубликате выживает
+    бокс с более надёжно сматчившегося донора. max_dist намеренно не режется:
+    доноры заданы явно, качество каждой пары гейтится inliers-порогами."""
+    t = items[ti]
+    cands = []
+    for si in range(lo, hi + 1):
+        if si == ti:
+            continue
+        if allowed is not None and si not in allowed:
+            continue
+        if len(rect_regions(items[si])) < min_source_regions:
+            continue
+        gm = len(good_matches(items[ti].get('des'), items[si].get('des')))
+        if gm > 0:
+            cands.append((gm, si))
+    cands.sort(reverse=True)
+    if not cands:
+        return {'target': t['fn'], 'status': 'no_source_in_cluster',
+                'dist': '', 'source': '', 'boxes_in': 0, 'boxes_kept': 0}
+
+    collected, donor_stats = [], []
+    for rank, (gm, si) in enumerate(cands):
+        src = items[si]
+        H, stats = estimate_H_cached(src, t, min_inliers=min_inliers,
+                                     min_inlier_ratio=min_inlier_ratio,
+                                     allow_affine=allow_affine)
+        stats['donor'] = src['fn']
+        donor_stats.append(stats)
+        if H is None:
+            continue
+        for r in rect_regions(src):
+            wh = warp_rect(r['shape_attributes'], H, stats['img_w'], stats['img_h'])
+            if wh is None:
+                continue
+            nr = copy.deepcopy(r)
+            nr['shape_attributes'] = {'name': 'rect', 'x': wh[0], 'y': wh[1],
+                                      'width': wh[2], 'height': wh[3]}
+            collected.append({'x': wh[0], 'y': wh[1], 'w': wh[2], 'h': wh[3],
+                              'donor': si, 'region': nr})
+
+    n_ok = sum(1 for d in donor_stats if d['status'] == 'ok')
+    used = []
+    for b in collected:
+        fn = items[b['donor']]['fn']
+        if fn not in used:
+            used.append(fn)
+
+    if not collected:
+        st = donor_stats[0]['status'] if donor_stats else 'no_source_in_cluster'
+        return {'target': t['fn'], 'status': st, 'dist': '',
+                'source': ';'.join(d['donor'] for d in donor_stats),
+                'boxes_in': 0, 'boxes_kept': 0, 'dedup_dropped': 0}
+
+    kept_boxes, dropped_boxes = dedup_boxes(collected, dup_overlap)
+    tgt_meta = via['_via_img_metadata'][t['key']]
+    tgt_meta['regions'] = [b['region'] for b in kept_boxes]
+    items[ti]['regions'] = tgt_meta['regions']
+
+    ok_stats = [d for d in donor_stats if d['status'] == 'ok']
+    row = {'target': t['fn'], 'source': ';'.join(used), 'dist': '',
+           'status': 'ok' if n_ok == len(cands) else ('ok_partial' if n_ok else 'all_failed'),
+           'method': f'multi({n_ok}/{len(cands)})',
+           'donor_matches': cands[0][0],
+           'boxes_in': len(collected), 'boxes_kept': len(kept_boxes),
+           'dedup_dropped': len(dropped_boxes)}
+    if ok_stats:
+        row['inliers'] = min(d.get('inliers', 0) for d in ok_stats)
+        row['inlier_ratio'] = min(d.get('inlier_ratio', 0) for d in ok_stats)
+    return row
 
 
 def draw_previews(via, root, out_dir, targets, max_w=1280):
@@ -558,24 +674,31 @@ def cmd_apply(args, via, items, root, clusters, donor_fns=None):
     targets, how = choose_targets(args, items, clusters, donor_fns)
     print(f'Целей: {len(targets)} ({how})')
     print_clusters(clusters, items, targets)
+    if args.merge_donors:
+        print(f'Режим суммы доноров: на цель переносится объединение боксов всех '
+              f'доноров кластера; дубликат = перекрытие >= {args.dup_overlap:.0%} '
+              f'площади боксом с другого донора')
     min_src = 1 if donor_fns else args.min_source_regions
     via, rows = propagate(via, root, targets, max_dist=args.max_dist,
                           min_source_regions=min_src,
                           min_inliers=args.min_inliers,
                           min_inlier_ratio=args.min_inlier_ratio,
                           allow_affine=not args.no_affine, chain=args.chain,
-                          clusters=clusters, items=items)
+                          clusters=clusters, items=items,
+                          merge_donors=args.merge_donors,
+                          dup_overlap=args.dup_overlap)
     report(args, via, root, targets, rows)
 
 
 def report(args, via, root, targets, rows):
     cols = ['target', 'source', 'dist', 'status', 'method', 'donor_matches',
-            'matches', 'inliers', 'inlier_ratio', 'boxes_in', 'boxes_kept']
+            'matches', 'inliers', 'inlier_ratio', 'boxes_in', 'boxes_kept', 'dedup_dropped']
     n_ok = 0
     for r in rows:
-        n_ok += r.get('status') == 'ok'
+        n_ok += str(r.get('status', '')).startswith('ok')
+        suffix = f" (−{r['dedup_dropped']} дублей)" if r.get('dedup_dropped') else ''
         print('  {target} <- {source} [{status}] {method} dm={donor_matches} '
-              'boxes={boxes_kept}/{boxes_in}'.format(**{k: r.get(k, '') for k in cols}))
+              'boxes={boxes_kept}/{boxes_in}'.format(**{k: r.get(k, '') for k in cols}) + suffix)
     print(f'Итого: ok {n_ok}/{len(rows)}')
     if args.report:
         with open(args.report, 'w', newline='', encoding='utf-8') as f:
@@ -584,7 +707,7 @@ def report(args, via, root, targets, rows):
             wr.writerows(rows)
         print('Отчёт: ' + args.report)
     if args.draw:
-        ok = [i for i, r in zip(targets, rows) if r.get('status') == 'ok']
+        ok = [i for i, r in zip(targets, rows) if str(r.get('status', '')).startswith('ok')]
         draw_previews(via, root, args.draw, ok)
         print('Превью: ' + args.draw)
     if not args.dry:
@@ -629,6 +752,12 @@ def main():
     ap.add_argument('--cut-abs', type=float, default=0.55, help='абсолютный порог сигнатур')
     ap.add_argument('--donors-per-cluster', type=int, default=0,
                     help='сколько кадров предлагать на кластер (0 = авто 2-5)')
+    ap.add_argument('--merge-donors', action='store_true',
+                    help='на цель переносится СУММА боксов со всех размеченных доноров '
+                         'кластера (а не с одного лучшего), дубликаты режутся по --dup-overlap')
+    ap.add_argument('--dup-overlap', type=float, default=0.65,
+                    help='доля площади бокса (0..1), накрытая боксом с другого донора, '
+                         'при которой бокс считается дубликатом и выбрасывается')
     ap.add_argument('--sig-feats', type=int, default=2500)
     ap.add_argument('--max-dim', type=int, default=1600)
     ap.add_argument('--chain', action='store_true')
