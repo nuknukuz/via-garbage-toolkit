@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-via_propagate.py v4.2.2 — полуавтоматическая разметка паков кадров VIA 2.x.
+via_propagate.py v4.3 — полуавтоматическая разметка паков кадров VIA 2.x.
 
 РАБОЧИЙ ЦИКЛ (два запуска):
 
@@ -34,6 +34,11 @@ via_propagate.py v4.2.2 — полуавтоматическая разметк�
        дополнительно режутся --max-dist);
      - доноры, не прошедшие матчинг с целью, видны в отчёте: строка цели
        заканчивается на "(не сошлись: файл:статус)" + колонка failed_donors.
+     - с --lens-k auto учитывается радиальная дисторсия объектива
+       (division model, 1 параметр): k оценивается по совпадениям пар внутри
+       КАЖДОГО кластера (объектив константен внутри кластера, между
+       кластерами может меняться), затем H уточняется ЛМ при
+       фиксированном k кластера; --lens-k ЧИСЛО — фиксированный k.
 
   Резерв (если план потерян/терминал слетел):
        python via_propagate.py marked.json --clusters "2685-2730,2731-2912" --donors "garbage.0002690.jpg,garbage.0002738.jpg" --root . --out filled.json [--merge-donors]
@@ -357,12 +362,262 @@ def pick_donor(items, ti, lo, hi, min_regions, max_dist, ratio=0.78, allowed=Non
     return (best[1], best[0][0]) if best else (None, 0)
 
 
+# ----------------------------- дисторсия объектива -----------------------------
+
+def lens_norm_params(w, h):
+    """Нормализация координат: центр кадра — главная точка, полудиагональ —
+    масштаб (угол кадра имеет r = 1)."""
+    return (w / 2.0, h / 2.0), 0.5 * (w * w + h * h) ** 0.5
+
+
+def lens_undistort(u, k):
+    """Division model (1 параметр): искажённая -> идеальная точка. k<0 — бочка."""
+    import numpy as np
+    r2 = (u ** 2).sum(axis=-1, keepdims=True)
+    return u / (1.0 + k * r2)
+
+
+def lens_distort(u, k):
+    """Division model: идеальная -> искажённая (замкнутая форма, обратная к lens_undistort)."""
+    import numpy as np
+    r = np.sqrt((u ** 2).sum(axis=-1, keepdims=True))
+    return u * (2.0 / (1.0 + np.sqrt(np.maximum(1e-12, 1.0 - 4.0 * k * r ** 2))))
+
+
+def _apply_Hn(H, u):
+    import numpy as np
+    q = (H @ np.hstack([u, np.ones((len(u), 1))]).T).T
+    return q[:, :2] / q[:, 2:3]
+
+
+def lens_chain(u_s, Hn, k):
+    """Строгая карта переноса в норм. координатах: D^-1 -> H -> D."""
+    return lens_distort(_apply_Hn(Hn, lens_undistort(u_s, k)), k)
+
+
+def weighted_median(values, weights):
+    import numpy as np
+    v = np.asarray(values, float)
+    w = np.asarray(weights, float)
+    o = np.argsort(v)
+    v, w = v[o], w[o]
+    cw = np.cumsum(w)
+    return float(v[min(len(v) - 1, int(np.searchsorted(cw, 0.5 * cw[-1])))])
+
+
+def lm_refine_Hk(us, ut, H0, k0=0.0, k_fix=None, max_iter=80):
+    """Левенберг–Марквардт по (H, k) на ИНЛАЕРАХ (L2; робастность уже дал MAGSAC).
+    us, ut — Nx2 норм. координаты искажённых точек; H0 — старт в норм. координатах.
+    k_fix=None -> k свободен; иначе H уточняется при фиксированном k_fix.
+    Без scipy: численный якобиан (8-9 параметров). Возвращает (Hn, k, ok)."""
+    import numpy as np
+    free_k = k_fix is None
+
+    def unpack(th):
+        H = np.array([[th[0], th[1], th[2]],
+                      [th[3], th[4], th[5]],
+                      [th[6], th[7], 1.0]])
+        return H, (th[8] if free_k else k_fix)
+
+    th = np.concatenate([H0[:2].ravel(), H0[2, :2], [k0 if free_k else 0.0]])
+    th = th[:9] if free_k else th[:8]
+
+    def res(th_):
+        H, k = unpack(th_)
+        return (lens_chain(us, H, k) - ut).ravel()
+
+    r = res(th)
+    cost = float((r ** 2).sum())
+    lam, ok = 1e-3, False
+    for _ in range(max_iter):
+        J = np.empty((len(r), len(th)))
+        for j in range(len(th)):
+            stp = 1e-6 * max(1.0, abs(th[j]))
+            th2 = th.copy()
+            th2[j] += stp
+            J[:, j] = (res(th2) - r) / stp
+        A = J.T @ J
+        g = J.T @ r
+        try:
+            d = np.linalg.solve(A + lam * np.diag(np.diag(A) + 1e-12), -g)
+        except np.linalg.LinAlgError:
+            break
+        th_new = th + d
+        Hn, kn = unpack(th_new)
+        bad = (not np.isfinite(Hn).all()) or (free_k and (not np.isfinite(kn) or abs(kn) > 0.35))
+        r_new = None if bad else res(th_new)
+        if not bad and float((r_new ** 2).sum()) < cost:
+            th, r, cost = th_new, r_new, float((r_new ** 2).sum())
+            lam = max(lam * 0.3, 1e-9)
+            ok = True
+            if np.linalg.norm(d) < 1e-12:
+                break
+        else:
+            lam *= 10
+            if lam > 1e8:
+                break
+    H, k = unpack(th)
+    return H, k, ok
+
+
+def estimate_Hk_cached(A, B, good, ransac_thr=3.0, min_inliers=12,
+                       min_inlier_ratio=0.25, allow_affine=True, k_fix=None):
+    """Перенос с учётом дисторсии. MAGSAC по искажённым точкам (как раньше) ->
+    ЛМ-уточнение (H, k) на инлаерах -> финальные инлаеры по репроекции через
+    lens_chain -> те же гейты min_inliers / min_inlier_ratio.
+    Возвращает (model | None, stats); model = {'Hn', 'k', 'wA', 'hA', 'wB', 'hB'}."""
+    try:
+        import cv2
+    except ImportError:
+        sys.exit('Нужен OpenCV:  pip install opencv-python-headless')
+    import numpy as np
+
+    stats = {'matches': len(good), 'img_w': B.get('w'), 'img_h': B.get('h')}
+    wA, hA, wB, hB = A.get('w'), A.get('h'), B.get('w'), B.get('h')
+    if len(good) < 8 or not all((wA, hA, wB, hB)):
+        stats['status'] = 'few_matches'
+        return None, stats
+    p1 = np.float32([A['kp'][m.queryIdx].pt for m in good])
+    p2 = np.float32([B['kp'][m.trainIdx].pt for m in good])
+    flags = getattr(cv2, 'USAC_MAGSAC', cv2.RANSAC)
+    Hs, inl = cv2.findHomography(p1, p2, flags, ransac_thr)
+    method = 'homography'
+    if Hs is None and allow_affine:
+        M, inl = cv2.estimateAffinePartial2D(p1, p2, method=cv2.RANSAC,
+                                             ransacReprojThreshold=ransac_thr)
+        if M is not None:
+            Hs = np.vstack([M, [0.0, 0.0, 1.0]])
+            method = 'affine_partial'
+    if Hs is None:
+        stats['status'] = 'no_homography'
+        return None, stats
+
+    sA, sB = A.get('s', 1.0), B.get('s', 1.0)
+    H_pix = unscale_H(Hs.astype(np.float64), sA, sB)
+    (cxA, cyA), fA = lens_norm_params(wA, hA)
+    (cxB, cyB), fB = lens_norm_params(wB, hB)
+    Ns = np.array([[1 / fA, 0, -cxA / fA], [0, 1 / fA, -cyA / fA], [0, 0, 1.0]])
+    Nt = np.array([[1 / fB, 0, -cxB / fB], [0, 1 / fB, -cyB / fB], [0, 0, 1.0]])
+    Hn0 = Nt @ H_pix @ np.linalg.inv(Ns)
+    Hn0 = Hn0 / Hn0[2, 2]
+    us = (p1.astype(np.float64) / sA - np.array([cxA, cyA])) / fA
+    ut = (p2.astype(np.float64) / sB - np.array([cxB, cyB])) / fB
+
+    inl_mask = inl.ravel().astype(bool) if inl is not None else np.ones(len(good), bool)
+    model, k_est = None, 0.0
+    if int(inl_mask.sum()) >= 6:
+        Hn, k_try, ok_lm = lm_refine_Hk(us[inl_mask], ut[inl_mask], Hn0,
+                                        k0=0.0, k_fix=k_fix)
+        if ok_lm and np.isfinite(Hn).all():
+            model = {'Hn': Hn, 'k': float(k_try), 'wA': wA, 'hA': hA, 'wB': wB, 'hB': hB}
+            k_est = float(k_try)
+            method += '+lens'
+    if model is None:  # ЛМ не сошёлся — честная гомография без дисторсии (k=0)
+        model = {'Hn': Hn0, 'k': 0.0, 'wA': wA, 'hA': hA, 'wB': wB, 'hB': hB}
+
+    err = np.linalg.norm(lens_chain(us, model['Hn'], model['k']) - ut, axis=1) * fB
+    inl2 = err < ransac_thr
+    n_inl = int(inl2.sum())
+    stats.update({'inliers': n_inl,
+                  'inlier_ratio': round(n_inl / max(1, len(good)), 3),
+                  'method': method, 'k': round(k_est, 4)})
+    if n_inl < min_inliers or stats['inlier_ratio'] < min_inlier_ratio:
+        stats['status'] = 'low_inliers'
+        return None, stats
+    stats['status'] = 'ok'
+    return model, stats
+
+
+def warp_box_lens(sa, model, min_keep_frac=0.25, min_side=3):
+    """Перенос rect-бокса цепочкой D^-1 -> H -> D: углы -> норм. -> идеал -> H ->
+    искажение -> пиксели цели -> axis-aligned bbox. Гейты как в warp_rect."""
+    import numpy as np
+    x, y, w, h = sa['x'], sa['y'], sa['width'], sa['height']
+    pts = np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.float64)
+    (cxA, cyA), fA = lens_norm_params(model['wA'], model['hA'])
+    (cxB, cyB), fB = lens_norm_params(model['wB'], model['hB'])
+    u = (pts - np.array([cxA, cyA])) / fA
+    q = lens_chain(u, model['Hn'], model['k']) * fB + np.array([cxB, cyB])
+    x0 = int(round(max(0, q[:, 0].min()))); x1 = int(round(min(model['wB'], q[:, 0].max())))
+    y0 = int(round(max(0, q[:, 1].min()))); y1 = int(round(min(model['hB'], q[:, 1].max())))
+    area_warped = max(0.0, q[:, 0].max() - q[:, 0].min()) * max(0.0, q[:, 1].max() - q[:, 1].min())
+    nw, nh = x1 - x0, y1 - y0
+    if nw < min_side or nh < min_side:
+        return None
+    if area_warped > 0 and (nw * nh) / area_warped < min_keep_frac:
+        return None
+    return x0, y0, nw, nh
+
+
+def _lens_prepass(items, targets, clusters, manual, donor_idx, merge_donors,
+                  min_source_regions, max_dist, min_inliers, min_inlier_ratio,
+                  allow_affine, lens):
+    """Пред-проход по кластерам: парные оценки (H, k) -> k кластера как
+    взвешенная медиана парных (объектив константен ВНУТРИ кластера) -> рефит H
+    при фиксированном k кластера. Возвращает (pair_models, pair_stats, donor_choice)."""
+    import numpy as np
+    pair_models, pair_stats, donor_choice = {}, {}, {}
+    pairs_by_cluster = {}
+    mcache = {}
+
+    def good_for(si, ti):
+        key = (si, ti)
+        if key not in mcache:
+            mcache[key] = good_matches(items[ti].get('des'), items[si].get('des'))
+        return mcache[key]
+
+    def estimate(si, ti, k_fix):
+        model, stats = estimate_Hk_cached(items[si], items[ti], good_for(si, ti),
+                                          min_inliers=min_inliers,
+                                          min_inlier_ratio=min_inlier_ratio,
+                                          allow_affine=allow_affine, k_fix=k_fix)
+        pair_models[(si, ti)] = model
+        pair_stats[(si, ti)] = stats
+
+    for ti in targets:
+        cl = cluster_of(clusters, ti) or (ti, ti)
+        lo, hi = cl
+        if merge_donors:
+            donors = [si for si in donor_pool(lo, hi, donor_idx)
+                      if si != ti and si in manual
+                      and len(rect_regions(items[si])) >= min_source_regions
+                      and len(good_for(si, ti)) > 0]
+        else:
+            si, _ = pick_donor(items, ti, lo, hi, min_source_regions, max_dist,
+                               allowed=manual, donor_idx=donor_idx)
+            donor_choice[ti] = si
+            donors = [si] if si is not None else []
+        for si in donors:
+            if (si, ti) not in pair_models:
+                estimate(si, ti, None if lens == 'auto' else lens)
+            pairs_by_cluster.setdefault(cl, set()).add((si, ti))
+
+    if lens == 'auto':
+        for cl, plist in sorted(pairs_by_cluster.items()):
+            ok = [(pair_stats[p]['k'], max(1, pair_stats[p].get('inliers', 0)))
+                  for p in plist if pair_stats[p].get('status') == 'ok'
+                  and pair_stats[p].get('method', '').endswith('+lens')]
+            if not ok:
+                continue
+            vals = [a for a, _ in ok]
+            wts = [b for _, b in ok]
+            k_cl = (weighted_median(vals, wts) if len(vals) >= 3
+                    else float(np.average(vals, weights=wts)))
+            for si, ti in plist:
+                estimate(si, ti, k_cl)
+            print(f'  lens k [кадры {items[cl[0]]["num"]}–{items[cl[1]]["num"]}]: '
+                  f'{k_cl:+.4f} (пар: {len(plist)}, сошлось: {len(ok)}, '
+                  f'разброс ±{float(np.std(vals)):.4f})', flush=True)
+    return pair_models, pair_stats, donor_choice
+
+
 # ----------------------------- перенос -----------------------------
 
 def propagate(via, root, targets, max_dist=8, min_source_regions=3,
               min_inliers=12, min_inlier_ratio=0.25, allow_affine=True,
               chain=False, clusters=None, items=None,
-              merge_donors=False, dup_overlap=0.65, donor_idx=None):
+              merge_donors=False, dup_overlap=0.65, donor_idx=None,
+              lens='off'):
     try:
         import cv2  # noqa: F401
     except ImportError:
@@ -373,6 +628,16 @@ def propagate(via, root, targets, max_dist=8, min_source_regions=3,
     manual = set(range(len(items))) - set(targets)
     rows = []
 
+    pair_models = pair_stats = None
+    donor_choice = {}
+    if lens != 'off':
+        if clusters is None:
+            clusters = [(0, len(items) - 1)]
+        pair_models, pair_stats, donor_choice = _lens_prepass(
+            items, targets, clusters, manual, donor_idx, merge_donors,
+            min_source_regions, max_dist, min_inliers, min_inlier_ratio,
+            allow_affine, lens)
+
     for ti in targets:
         t = items[ti]
         if clusters is not None:
@@ -381,26 +646,66 @@ def propagate(via, root, targets, max_dist=8, min_source_regions=3,
             allowed = None if chain else manual
 
             if merge_donors:
-                rows.append(_merge_donors_row(
-                    via, items, ti, lo, hi, allowed, min_source_regions,
-                    min_inliers, min_inlier_ratio, allow_affine, dup_overlap,
-                    donor_idx=donor_idx))
+                if lens != 'off':
+                    rows.append(_merge_donors_row_lens(
+                        via, items, ti, lo, hi, allowed, min_source_regions,
+                        dup_overlap, donor_idx, pair_models, pair_stats))
+                else:
+                    rows.append(_merge_donors_row(
+                        via, items, ti, lo, hi, allowed, min_source_regions,
+                        min_inliers, min_inlier_ratio, allow_affine, dup_overlap,
+                        donor_idx=donor_idx))
                 if chain:
                     manual.add(ti)
                 continue
 
-            si, donor_score = pick_donor(items, ti, lo, hi, min_source_regions, max_dist,
-                                         allowed=allowed, donor_idx=donor_idx)
+            if lens != 'off':
+                si = donor_choice.get(ti)
+                donor_score = pair_stats.get((si, ti), {}).get('matches', 0) \
+                    if si is not None else 0
+            else:
+                si, donor_score = pick_donor(items, ti, lo, hi, min_source_regions,
+                                             max_dist, allowed=allowed, donor_idx=donor_idx)
             if si is None:
                 rows.append({'target': t['fn'], 'status': 'no_source_in_cluster',
                              'dist': '', 'source': '', 'boxes_in': 0, 'boxes_kept': 0})
                 continue
             dist = abs(si - ti)
             src = items[si]
-            H, stats = estimate_H_cached(src, t, min_inliers=min_inliers,
-                                         min_inlier_ratio=min_inlier_ratio,
-                                         allow_affine=allow_affine)
+            if lens != 'off':
+                model = pair_models.get((si, ti))
+                stats = dict(pair_stats.get((si, ti), {}))
+                warp_fn = (lambda sa: warp_box_lens(sa, model)) if model else None
+            else:
+                H, stats = estimate_H_cached(src, t, min_inliers=min_inliers,
+                                             min_inlier_ratio=min_inlier_ratio,
+                                             allow_affine=allow_affine)
+                warp_fn = (lambda sa: warp_rect(sa, H, stats['img_w'], stats['img_h'])) \
+                    if H is not None else None
             stats['donor_matches'] = donor_score
+            if warp_fn is None:
+                rows.append({'target': t['fn'], 'source': src['fn'], 'dist': dist,
+                             **stats, 'boxes_in': 0, 'boxes_kept': 0})
+                continue
+
+            kept, total, new_regions = 0, 0, []
+            for r in rect_regions(src):
+                total += 1
+                wh = warp_fn(r['shape_attributes'])
+                if wh is None:
+                    continue
+                nr = copy.deepcopy(r)
+                nr['shape_attributes'] = {'name': 'rect', 'x': wh[0], 'y': wh[1],
+                                          'width': wh[2], 'height': wh[3]}
+                new_regions.append(nr)
+                kept += 1
+            tgt_meta = via['_via_img_metadata'][t['key']]
+            tgt_meta['regions'] = new_regions
+            items[ti]['regions'] = tgt_meta['regions']
+            rows.append({'target': t['fn'], 'source': src['fn'], 'dist': dist,
+                         **stats, 'boxes_in': total, 'boxes_kept': kept})
+            if chain:
+                manual.add(ti)
         else:
             allowed = None if chain else manual
             si = dist = None
@@ -421,30 +726,111 @@ def propagate(via, root, targets, max_dist=8, min_source_regions=3,
             H, stats = estimate_H_cached(src, t, min_inliers=min_inliers,
                                          min_inlier_ratio=min_inlier_ratio,
                                          allow_affine=allow_affine)
-        if H is None:
-            rows.append({'target': t['fn'], 'source': src['fn'], 'dist': dist,
-                         **stats, 'boxes_in': 0, 'boxes_kept': 0})
-            continue
+            if H is None:
+                rows.append({'target': t['fn'], 'source': src['fn'], 'dist': dist,
+                             **stats, 'boxes_in': 0, 'boxes_kept': 0})
+                continue
 
-        kept, total, new_regions = 0, 0, []
+            kept, total, new_regions = 0, 0, []
+            for r in rect_regions(src):
+                total += 1
+                wh = warp_rect(r['shape_attributes'], H, stats['img_w'], stats['img_h'])
+                if wh is None:
+                    continue
+                nr = copy.deepcopy(r)
+                nr['shape_attributes'] = {'name': 'rect', 'x': wh[0], 'y': wh[1],
+                                          'width': wh[2], 'height': wh[3]}
+                new_regions.append(nr)
+                kept += 1
+            tgt_meta = via['_via_img_metadata'][t['key']]
+            tgt_meta['regions'] = new_regions
+            items[ti]['regions'] = tgt_meta['regions']
+            rows.append({'target': t['fn'], 'source': src['fn'], 'dist': dist,
+                         **stats, 'boxes_in': total, 'boxes_kept': kept})
+            if chain:
+                manual.add(ti)
+    return via, rows
+
+
+def _merge_donors_row_lens(via, items, ti, lo, hi, allowed, min_source_regions,
+                           dup_overlap, donor_idx, pair_models, pair_stats):
+    """Сумма боксов со всех доноров кластера по предрасчитанным парам с учётом
+    дисторсии (_lens_prepass). Логика отчёта и дедупликации — как в
+    _merge_donors_row."""
+    t = items[ti]
+    cands = []
+    for si in donor_pool(lo, hi, donor_idx):
+        if si == ti:
+            continue
+        if allowed is not None and si not in allowed:
+            continue
+        if len(rect_regions(items[si])) < min_source_regions:
+            continue
+        st = pair_stats.get((si, ti))
+        if st is None:
+            continue
+        gm = st.get('matches', 0)
+        if gm > 0:
+            cands.append((gm, si))
+    cands.sort(reverse=True)
+    if not cands:
+        return {'target': t['fn'], 'status': 'no_source_in_cluster',
+                'dist': '', 'source': '', 'boxes_in': 0, 'boxes_kept': 0}
+
+    collected, donor_stats = [], []
+    for rank, (gm, si) in enumerate(cands):
+        src = items[si]
+        stats = dict(pair_stats[(si, ti)])
+        stats['donor'] = src['fn']
+        donor_stats.append(stats)
+        model = pair_models.get((si, ti))
+        if model is None:
+            continue
         for r in rect_regions(src):
-            total += 1
-            wh = warp_rect(r['shape_attributes'], H, stats['img_w'], stats['img_h'])
+            wh = warp_box_lens(r['shape_attributes'], model)
             if wh is None:
                 continue
             nr = copy.deepcopy(r)
             nr['shape_attributes'] = {'name': 'rect', 'x': wh[0], 'y': wh[1],
                                       'width': wh[2], 'height': wh[3]}
-            new_regions.append(nr)
-            kept += 1
-        tgt_meta = via['_via_img_metadata'][t['key']]
-        tgt_meta['regions'] = new_regions
-        items[ti]['regions'] = tgt_meta['regions']
-        rows.append({'target': t['fn'], 'source': src['fn'], 'dist': dist,
-                     **stats, 'boxes_in': total, 'boxes_kept': kept})
-        if chain:
-            manual.add(ti)
-    return via, rows
+            collected.append({'x': wh[0], 'y': wh[1], 'w': wh[2], 'h': wh[3],
+                              'donor': si, 'region': nr})
+
+    n_ok = sum(1 for d in donor_stats if d['status'] == 'ok')
+    failed = ';'.join(f"{d['donor']}:{d['status']}"
+                      for d in donor_stats if d['status'] != 'ok')
+    used = []
+    for b in collected:
+        fn = items[b['donor']]['fn']
+        if fn not in used:
+            used.append(fn)
+
+    if not collected:
+        st = donor_stats[0]['status'] if donor_stats else 'no_source_in_cluster'
+        return {'target': t['fn'], 'status': st, 'dist': '',
+                'source': ';'.join(d['donor'] for d in donor_stats),
+                'boxes_in': 0, 'boxes_kept': 0, 'dedup_dropped': 0,
+                'failed_donors': failed}
+
+    kept_boxes, dropped_boxes = dedup_boxes(collected, dup_overlap)
+    tgt_meta = via['_via_img_metadata'][t['key']]
+    tgt_meta['regions'] = [b['region'] for b in kept_boxes]
+    items[ti]['regions'] = tgt_meta['regions']
+
+    ok_stats = [d for d in donor_stats if d['status'] == 'ok']
+    ks = sorted({str(d.get('k')) for d in ok_stats if d.get('k') is not None})
+    row = {'target': t['fn'], 'source': ';'.join(used), 'dist': '',
+           'status': 'ok' if n_ok == len(cands) else ('ok_partial' if n_ok else 'all_failed'),
+           'method': f'multi({n_ok}/{len(cands)})',
+           'k': ';'.join(ks),
+           'donor_matches': cands[0][0],
+           'boxes_in': len(collected), 'boxes_kept': len(kept_boxes),
+           'dedup_dropped': len(dropped_boxes),
+           'failed_donors': failed}
+    if ok_stats:
+        row['inliers'] = min(d.get('inliers', 0) for d in ok_stats)
+        row['inlier_ratio'] = min(d.get('inlier_ratio', 0) for d in ok_stats)
+    return row
 
 
 def _merge_donors_row(via, items, ti, lo, hi, allowed, min_source_regions,
@@ -699,6 +1085,15 @@ def cmd_apply(args, via, items, root, clusters, donor_fns=None):
         if out_cl:
             print('Доноры вне интервалов кластеров: ' + ', '.join(out_cl) +
                   ' — используются как источники для всех целей')
+    lens = getattr(args, 'lens_k', 'off')
+    if lens not in ('off', 'auto'):
+        try:
+            lens = float(lens)
+        except (TypeError, ValueError):
+            sys.exit('--lens-k: ожидается off | auto | число (например -0.08)')
+    if lens != 'off':
+        print('Учёт дисторсии: ' + ('оценка k по каждому кластеру (auto)'
+                                    if lens == 'auto' else f'фиксированный k = {lens:+.4f}'))
     print(f'Словарь признаков для {len(items)} кадров...')
     build_dictionary(items, root, max_dim=args.max_dim, nfeatures=args.sig_feats)
     targets, how = choose_targets(args, items, clusters, donor_fns)
@@ -716,12 +1111,13 @@ def cmd_apply(args, via, items, root, clusters, donor_fns=None):
                           allow_affine=not args.no_affine, chain=args.chain,
                           clusters=clusters, items=items,
                           merge_donors=args.merge_donors,
-                          dup_overlap=args.dup_overlap, donor_idx=donor_idx)
+                          dup_overlap=args.dup_overlap, donor_idx=donor_idx,
+                          lens=lens)
     report(args, via, root, targets, rows)
 
 
 def report(args, via, root, targets, rows):
-    cols = ['target', 'source', 'dist', 'status', 'method', 'donor_matches',
+    cols = ['target', 'source', 'dist', 'status', 'method', 'k', 'donor_matches',
             'matches', 'inliers', 'inlier_ratio', 'boxes_in', 'boxes_kept',
             'dedup_dropped', 'failed_donors']
     n_ok = 0
@@ -794,6 +1190,11 @@ def main():
     ap.add_argument('--sig-feats', type=int, default=2500)
     ap.add_argument('--max-dim', type=int, default=1600)
     ap.add_argument('--chain', action='store_true')
+    ap.add_argument('--lens-k', default='off', metavar='off|auto|K',
+                    help='радиальная дисторсия (division model, 1 параметр): '
+                         'off — выкл (как раньше); auto — k оценивается по каждому '
+                         'кластеру отдельно (медиана парных оценок, затем рефит H); '
+                         'число, например -0.08 — фиксированный k для всех пар')
     ap.add_argument('--no-affine', action='store_true')
     ap.add_argument('--dry', action='store_true')
     args = ap.parse_args()
